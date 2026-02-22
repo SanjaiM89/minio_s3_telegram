@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -73,7 +75,6 @@ func (t *TelegramObjectLayer) uploadWorker() {
 	for job := range t.uploadQueue {
 		func() {
 			var upload tg.InputFileClass
-			var err error
 
 			// Ensure we close the reader after the job is done
 			if closer, ok := job.reader.(io.Closer); ok {
@@ -81,38 +82,91 @@ func (t *TelegramObjectLayer) uploadWorker() {
 			}
 
 			// Phase 1: Upload the file data with retries
-			for retries := 0; retries < 10; retries++ {
-				upload, err = u.Upload(job.ctx, uploader.NewUpload(job.partName, job.reader, job.size))
-				if err == nil {
+			buf := make([]byte, 512*1024)
+			var b [8]byte
+			rand.Read(b[:])
+			fileID := int64(binary.LittleEndian.Uint64(b[:]))
+			if fileID < 0 {
+				fileID = -fileID
+			}
+
+			totalParts := int((job.size + int64(len(buf)) - 1) / int64(len(buf)))
+			partIdx := 0
+			var uploadErr error
+
+			for {
+				n, readErr := io.ReadFull(job.reader, buf)
+				if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+					uploadErr = fmt.Errorf("read failed: %w", readErr)
+					break
+				}
+				if n == 0 {
 					break
 				}
 
-				// Reset reader if possible for retry
-				if seeker, ok := job.reader.(io.Seeker); ok {
-					seeker.Seek(0, io.SeekStart)
+				chunkData := buf[:n]
+				var chunkErr error
+				api := t.tgClient.API()
+
+				for retries := 0; retries < 15; retries++ {
+					t.hashMu.RLock()
+					reqCtx := t.runCtx
+					t.hashMu.RUnlock()
+					if reqCtx == nil {
+						reqCtx = job.ctx
+					}
+
+					_, chunkErr = api.UploadSaveBigFilePart(reqCtx, &tg.UploadSaveBigFilePartRequest{
+						FileID:         fileID,
+						FilePart:       partIdx,
+						FileTotalParts: totalParts,
+						Bytes:          chunkData,
+					})
+
+					if chunkErr == nil {
+						break
+					}
+
+					if d, ok := tgerr.AsFloodWait(chunkErr); ok {
+						time.Sleep(d + time.Second)
+						continue
+					}
+
+					fmt.Printf("Worker chunk upload attempt %d failed for %s part %d: %v. Retrying...\n", retries+1, job.partName, partIdx, chunkErr)
+					time.Sleep(time.Duration(retries+1) * 2 * time.Second)
 				}
 
-				if d, ok := tgerr.AsFloodWait(err); ok {
-					time.Sleep(d + time.Second)
-					continue
+				if chunkErr != nil {
+					uploadErr = fmt.Errorf("chunk %d upload failed after retries: %w", partIdx, chunkErr)
+					break
 				}
-
-				// For broken pipe or timeout, wait a bit and retry
-				fmt.Printf("Worker upload attempt %d failed for %s: %v. Retrying...\n", retries+1, job.partName, err)
-				time.Sleep(time.Duration(retries+1) * 2 * time.Second)
+				partIdx++
 			}
 
-			if err != nil {
-				job.resultChan <- uploadResult{err: fmt.Errorf("worker data upload failed after retries: %w", err)}
+			if uploadErr != nil {
+				job.resultChan <- uploadResult{err: uploadErr}
 				return
+			}
+
+			upload = &tg.InputFileBig{
+				ID:    fileID,
+				Parts: totalParts,
+				Name:  job.partName,
 			}
 
 			var msgUpdates tg.UpdatesClass
 			var lastErr error
 
+			t.hashMu.RLock()
+			sendCtx := t.runCtx
+			t.hashMu.RUnlock()
+			if sendCtx == nil {
+				sendCtx = job.ctx
+			}
+
 			// Phase 2: Send the file message with retries
 			for retries := 0; retries < 15; retries++ {
-				msgUpdates, lastErr = target.File(job.ctx, upload)
+				msgUpdates, lastErr = target.File(sendCtx, upload)
 				if lastErr == nil {
 					break
 				}
@@ -239,60 +293,69 @@ func NewTelegramObjectLayer(ctx context.Context, base ObjectLayer) (ObjectLayer,
 		uploadQueue: make(chan uploadJob, uploadQueueCapacity),
 	}
 
+	var readyOnce sync.Once
+
 	go func() {
-		err := client.Run(bgCtx, func(ctx context.Context) error {
-			authStatus, err := client.Auth().Status(ctx)
-			if err != nil {
-				return fmt.Errorf("failed to check auth status: %w", err)
-			}
-			if !authStatus.Authorized {
-				_, authErr := client.Auth().Bot(ctx, cfg.BotToken)
-				if authErr != nil {
-					fmt.Printf("Fatal: Telegram Bot Auth failed: %v\n", authErr)
-					return authErr
+		for {
+			err := client.Run(bgCtx, func(ctx context.Context) error {
+				authStatus, err := client.Auth().Status(ctx)
+				if err != nil {
+					return fmt.Errorf("failed to check auth status: %w", err)
 				}
-			}
+				if !authStatus.Authorized {
+					_, authErr := client.Auth().Bot(ctx, cfg.BotToken)
+					if authErr != nil {
+						fmt.Printf("Fatal: Telegram Bot Auth failed: %v\n", authErr)
+						return authErr
+					}
+				}
 
-			api := client.API()
-			chResult, err := api.ChannelsGetChannels(ctx, []tg.InputChannelClass{
-				&tg.InputChannel{ChannelID: cfg.BareChannelID, AccessHash: 0},
+				api := client.API()
+				chResult, err := api.ChannelsGetChannels(ctx, []tg.InputChannelClass{
+					&tg.InputChannel{ChannelID: cfg.BareChannelID, AccessHash: 0},
+				})
+				if err != nil {
+					fmt.Printf("Error fetching channel info: %v\n", err)
+				}
+
+				var hash int64
+				if chats, ok := chResult.(*tg.MessagesChats); ok && len(chats.Chats) > 0 {
+					chat := chats.Chats[0]
+					switch ch := chat.(type) {
+					case *tg.Channel:
+						hash = ch.AccessHash
+					case *tg.ChannelForbidden:
+						hash = ch.AccessHash
+						fmt.Printf("Warning: Channel is forbidden, but extracted hash: %d\n", ch.AccessHash)
+					default:
+						fmt.Printf("Unexpected chat type returned: %T\n", ch)
+					}
+				} else {
+					fmt.Printf("Failed to extract channel info from chResult: %v\n", chResult)
+				}
+
+				layer.hashMu.Lock()
+				if hash != 0 {
+					layer.channelAccessHash = hash
+				}
+				layer.runCtx = ctx
+				layer.hashMu.Unlock()
+
+				fmt.Printf("Telegram client connected (channelAccessHash=%d)\n", layer.channelAccessHash)
+
+				readyOnce.Do(func() {
+					close(layer.readyCh)
+					for i := 0; i < numUploadWorkers; i++ {
+						go layer.uploadWorker()
+					}
+				})
+
+				<-ctx.Done()
+				return ctx.Err()
 			})
-			if err != nil {
-				fmt.Printf("Error fetching channel info: %v\n", err)
-			}
-			if chats, ok := chResult.(*tg.MessagesChats); ok && len(chats.Chats) > 0 {
-				chat := chats.Chats[0]
-				switch ch := chat.(type) {
-				case *tg.Channel:
-					layer.hashMu.Lock()
-					layer.channelAccessHash = ch.AccessHash
-					layer.hashMu.Unlock()
-				case *tg.ChannelForbidden:
-					layer.hashMu.Lock()
-					layer.channelAccessHash = ch.AccessHash
-					layer.hashMu.Unlock()
-					fmt.Printf("Warning: Channel is forbidden, but extracted hash: %d\n", ch.AccessHash)
-				default:
-					fmt.Printf("Unexpected chat type returned: %T\n", ch)
-				}
-			} else {
-				fmt.Printf("Failed to extract channel info from chResult: %v\n", chResult)
-			}
-
-			layer.runCtx = ctx
-			close(layer.readyCh)
-			fmt.Printf("Telegram client ready (channelAccessHash=%d)\n", layer.channelAccessHash)
-
-			// Wait until the client is ready to start the upload workers
-			// because they need the client and access hash.
-			for i := 0; i < numUploadWorkers; i++ {
-				go layer.uploadWorker()
-			}
-
-			<-ctx.Done()
-			return ctx.Err()
-		})
-		fmt.Printf("TELEGRAM CLIENT RUN EXITED with error: %v\n", err)
+			fmt.Printf("TELEGRAM CLIENT RUN EXITED with error: %v. Reconnecting in 3s...\n", err)
+			time.Sleep(3 * time.Second)
+		}
 	}()
 
 	setObjectLayer(layer)

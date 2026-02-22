@@ -64,7 +64,10 @@ mc rm mytg/testbucket/myphoto.jpg
 - **Metadata**: Stored in a PostgreSQL database table (`objects`).
 - **Storage**: Files are uploaded to the specified Telegram channel in 20MB chunks (`parts` tracking).
 - **Session Persistence**: Authentication utilizes a local `tg_session.json` to prevent re-authentication on every server restart. Without this, the bot token can encounter `FLOOD_WAIT (1556 seconds)` closures.
-- **Resilient Downloads**: Manual `api.UploadGetFile` chunk fetching is employed with a connection recovery loop (~15 retries) to withstand TCP disconnects common to MTProto proxies.
+- **Resilient Uploads & Downloads**: 
+  - **Uploads**: Uses `api.UploadSaveBigFilePart` with a custom 512KB chunking loop and automatic engine reconnection (15 retries per chunk).
+  - **Downloads**: Manual `api.UploadGetFile` chunk fetching is employed with a connection recovery loop (~15 retries).
+  These custom handlers allow the MinIO node to survive constant TCP disconnects common to MTProto proxies without dropping the entire 20MB file part.
 
 ## Limitations
 
