@@ -1,11 +1,11 @@
 package cmd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,9 +16,8 @@ import (
 	"github.com/gotd/td/tgerr"
 )
 
-// MaxTelegramChunkSize is the maximum size of a single Telegram file upload
+// MaxTelegramChunkSize is the Telegram 2GB limit, we use 1.9GB to be safe
 const (
-	// MaxTelegramChunkSize is the Telegram 2GB limit, we use 1.9GB to be safe
 	MaxTelegramChunkSize = 1900 * 1024 * 1024
 )
 
@@ -34,17 +33,14 @@ type ObjectMetadata struct {
 }
 
 func (t *TelegramObjectLayer) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
-	// Delegate system files to native MinIO!
 	if t.isSystemBucket(bucket) {
 		return t.base.PutObject(ctx, bucket, object, data, opts)
 	}
 
-	// Wait for Telegram client to be ready
 	if err := t.tgReady(ctx); err != nil {
 		return ObjectInfo{}, err
 	}
 
-	// For small files (< 1KB), we can buffer in memory and store in DB
 	const smallFileLimit = 1024
 	streamingChunkSize := int64(MaxTelegramChunkSize)
 
@@ -52,7 +48,6 @@ func (t *TelegramObjectLayer) PutObject(ctx context.Context, bucket, object stri
 	var internalData []byte
 	var totalSize int64
 
-	// Cleanup function for temp files
 	var tempFiles []string
 	cleanup := func() {
 		for _, f := range tempFiles {
@@ -63,25 +58,20 @@ func (t *TelegramObjectLayer) PutObject(ctx context.Context, bucket, object stri
 	}
 	defer cleanup()
 
-	// Buffer to check small file limit
 	headerBuffer := make([]byte, smallFileLimit)
 	n, err := io.ReadFull(data.Reader, headerBuffer)
 
-	// Handle errors, but allow EOF if file is smaller than smallFileLimit
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return ObjectInfo{}, fmt.Errorf("failed to read initial data: %w", err)
 	}
 
 	if n < smallFileLimit {
-		// Small file case: < 1KB
 		internalData = headerBuffer[:n]
 		totalSize = int64(n)
 	} else {
-		// Large file case: >= 1KB
 		totalSize = 0
 		partNum := 1
 
-		// Create first part from what we already read
 		tmpFile, err := os.CreateTemp("", fmt.Sprintf("minio-tg-part-%d-*", partNum))
 		if err != nil {
 			return ObjectInfo{}, fmt.Errorf("failed to create temp file for part %d: %w", partNum, err)
@@ -93,10 +83,8 @@ func (t *TelegramObjectLayer) PutObject(ctx context.Context, bucket, object stri
 
 		var resultChans []chan uploadResult
 
-		// Continue reading and uploading chunks
 		eof := false
 		for !eof {
-			// Read the rest of the chunk
 			m, err := io.CopyN(tmpFile, data.Reader, streamingChunkSize-int64(wn))
 			if err != nil {
 				if err == io.EOF {
@@ -110,7 +98,6 @@ func (t *TelegramObjectLayer) PutObject(ctx context.Context, bucket, object stri
 			chunkActualSize := int64(wn) + m
 			tmpFile.Close()
 
-			// Queue the chunk for upload
 			resChan := make(chan uploadResult, 1)
 			reopenedFile, _ := os.Open(tmpFile.Name())
 
@@ -132,7 +119,7 @@ func (t *TelegramObjectLayer) PutObject(ctx context.Context, bucket, object stri
 
 			if !eof {
 				partNum++
-				wn = 0 // Reset for next chunk
+				wn = 0
 				tmpFile, err = os.CreateTemp("", fmt.Sprintf("minio-tg-part-%d-*", partNum))
 				if err != nil {
 					return ObjectInfo{}, fmt.Errorf("failed to create temp file for part %d: %w", partNum, err)
@@ -141,7 +128,6 @@ func (t *TelegramObjectLayer) PutObject(ctx context.Context, bucket, object stri
 			}
 		}
 
-		// Wait for all chunk uploads to complete
 		for i, resChan := range resultChans {
 			select {
 			case result := <-resChan:
@@ -203,19 +189,209 @@ func (tw *trackingWriter) Write(p []byte) (n int, err error) {
 	if n > 0 {
 		*tw.total += int64(n)
 	}
-	if err != nil {
-		fmt.Printf("trackingWriter Write Error: %v\n", err)
-	}
 	return n, err
 }
 
+// batchFetchDocuments fetches all documents for the given message IDs in a single API call.
+func (t *TelegramObjectLayer) batchFetchDocuments(ctx context.Context, api *tg.Client, msgIDs []int) (map[int]*tg.Document, error) {
+	if len(msgIDs) == 0 {
+		return nil, nil
+	}
+
+	ids := make([]tg.InputMessageClass, len(msgIDs))
+	for i, msgID := range msgIDs {
+		ids[i] = &tg.InputMessageID{ID: msgID}
+	}
+
+	hash := t.channelAccessHash.Load()
+	fmt.Printf("DEBUG: batchFetchDocuments using ChannelID=%d, AccessHash=%d, numMsgIDs=%d\n", t.config.BareChannelID, hash, len(msgIDs))
+
+	var resp tg.MessagesMessagesClass
+	var lastErr error
+	for retries := 0; retries < 15; retries++ {
+		resp, lastErr = api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+			Channel: &tg.InputChannel{ChannelID: t.config.BareChannelID, AccessHash: hash},
+			ID:      ids,
+		})
+		if lastErr == nil {
+			break
+		}
+		if d, ok := tgerr.AsFloodWait(lastErr); ok {
+			time.Sleep(d + time.Second)
+			continue
+		}
+		fmt.Printf("DEBUG: batchFetchDocuments attempt %d failed: %v\n", retries+1, lastErr)
+		time.Sleep(time.Duration(retries+1) * 200 * time.Millisecond)
+	}
+	if lastErr != nil {
+		fmt.Printf("DEBUG: batchFetchDocuments final error: %v\n", lastErr)
+		return nil, lastErr
+	}
+
+	var rawMessages []tg.MessageClass
+	switch m := resp.(type) {
+	case *tg.MessagesMessages:
+		rawMessages = m.Messages
+	case *tg.MessagesMessagesSlice:
+		rawMessages = m.Messages
+	case *tg.MessagesChannelMessages:
+		rawMessages = m.Messages
+	}
+
+	docs := make(map[int]*tg.Document, len(rawMessages))
+	for _, raw := range rawMessages {
+		msg, ok := raw.(*tg.Message)
+		if !ok {
+			continue
+		}
+		if doc, ok := t.extractDocument(msg); ok {
+			docs[msg.ID] = doc
+		}
+	}
+	return docs, nil
+}
+
+func (t *TelegramObjectLayer) downloadTelegramDocument(ctx context.Context, api *tg.Client, doc *tg.Document, w io.Writer, startOffset, length int64) error {
+	loc := doc.AsInputDocumentFileLocation()
+	if length == -1 {
+		length = doc.Size - startOffset
+	}
+
+	const chunkSize = 1024 * 1024 // 1 MiB chunks (Telegram max)
+	const maxParallelChunks = 64
+
+	type chunkResult struct {
+		offset int64
+		data   []byte
+		err    error
+	}
+
+	resultCh := make(chan chunkResult, maxParallelChunks*2)
+	fetchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sem := make(chan struct{}, maxParallelChunks)
+
+	go func() {
+		// Telegram upload.getFile requires:
+		// 1. limit is a multiple of 1024
+		// 2. offset is a multiple of limit
+		// 3. limit <= 1048576 (1 MiB)
+		// We align our requests to chunkSize boundaries and trim later.
+		
+		requestedEnd := startOffset + length
+		
+		// First block might be unaligned
+		firstBlockStart := (startOffset / int64(chunkSize)) * int64(chunkSize)
+		
+		for fetchOffset := firstBlockStart; fetchOffset < requestedEnd; fetchOffset += int64(chunkSize) {
+			select {
+			case <-fetchCtx.Done():
+				return
+			case sem <- struct{}{}:
+			}
+
+			go func(off int64) {
+				var chunkData []byte
+				var dlErr error
+
+				for retries := 0; retries < 15; retries++ {
+					// We always request a full chunkSize to satisfy alignment
+					req := &tg.UploadGetFileRequest{
+						Offset:   off,
+						Limit:    chunkSize,
+						Location: loc,
+					}
+					res, err := api.UploadGetFile(fetchCtx, req)
+					if err == nil {
+						switch f := res.(type) {
+						case *tg.UploadFile:
+							chunkData = f.Bytes
+							dlErr = nil
+						case *tg.UploadFileCDNRedirect:
+							dlErr = fmt.Errorf("CDN redirect not supported")
+						default:
+							dlErr = fmt.Errorf("unexpected file type: %T", res)
+						}
+						if dlErr == nil {
+							break
+						}
+					} else {
+						dlErr = err
+					}
+
+					if d, ok := tgerr.AsFloodWait(dlErr); ok {
+						time.Sleep(d + time.Second)
+						continue
+					}
+					time.Sleep(time.Duration(retries+1) * 200 * time.Millisecond)
+				}
+
+				<-sem
+
+				// Trim the chunk data if it exceeds actual document size
+				if int64(len(chunkData)) > doc.Size - off {
+					chunkData = chunkData[:doc.Size-off]
+				}
+
+				select {
+				case resultCh <- chunkResult{offset: off, data: chunkData, err: dlErr}:
+				case <-fetchCtx.Done():
+				}
+			}(fetchOffset)
+		}
+	}()
+
+	// Sequencer: write chunks to w in order, trimming to the requested range
+	currentBlockOffset := (startOffset / int64(chunkSize)) * int64(chunkSize)
+	requestedEnd := startOffset + length
+	received := make(map[int64][]byte)
+
+	for currentBlockOffset < requestedEnd {
+		if data, ok := received[currentBlockOffset]; ok {
+			// Calculate overlap with requested range [startOffset, requestedEnd)
+			blockEnd := currentBlockOffset + int64(len(data))
+			
+			writeStart := int64(0)
+			if currentBlockOffset < startOffset {
+				writeStart = startOffset - currentBlockOffset
+			}
+			
+			writeEnd := int64(len(data))
+			if blockEnd > requestedEnd {
+				writeEnd = int64(len(data)) - (blockEnd - requestedEnd)
+			}
+
+			if writeStart < writeEnd {
+				if _, err := w.Write(data[writeStart:writeEnd]); err != nil {
+					return err
+				}
+			}
+			
+			delete(received, currentBlockOffset)
+			currentBlockOffset += int64(chunkSize) // Move to next alignment boundary
+			continue
+		}
+
+		select {
+		case res := <-resultCh:
+			if res.err != nil {
+				return res.err
+			}
+			received[res.offset] = res.data
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return nil
+}
+
 func (t *TelegramObjectLayer) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (gr *GetObjectReader, err error) {
-	// Delegate system files to native MinIO!
 	if t.isSystemBucket(bucket) {
 		return t.base.GetObjectNInfo(ctx, bucket, object, rs, h, opts)
 	}
 
-	// Wait for Telegram client to be ready
 	if err := t.tgReady(ctx); err != nil {
 		return nil, err
 	}
@@ -243,8 +419,13 @@ func (t *TelegramObjectLayer) GetObjectNInfo(ctx context.Context, bucket, object
 		ContentType: meta.ContentType,
 	}
 
+	startOffset, length, err := rs.GetOffsetLength(objInfo.Size)
+	if err != nil {
+		return nil, err
+	}
+
 	if len(internalData) > 0 {
-		return NewGetObjectReaderFromReader(bytes.NewReader(internalData), objInfo, opts)
+		return NewGetObjectReaderFromReader(bytes.NewReader(internalData[startOffset:startOffset+length]), objInfo, opts)
 	}
 
 	pr, pw := io.Pipe()
@@ -252,305 +433,101 @@ func (t *TelegramObjectLayer) GetObjectNInfo(ctx context.Context, bucket, object
 	go func() {
 		streamCtx := t.runCtx
 		var totalBytesWritten int64
-		// Create a writer that logs EVERY byte written and every error encountered to debug pipe closures.
-		tw := &trackingWriter{Writer: pw, total: &totalBytesWritten}
+
+		// 16MB pipe buffer to prevent download goroutines from stalling
+		bw := bufio.NewWriterSize(pw, 16*1024*1024)
+		tw := &trackingWriter{Writer: bw, total: &totalBytesWritten}
 
 		defer func() {
+			bw.Flush()
 			pw.Close()
-			fmt.Printf("Telegram Download Goroutine Exited. Total Written: %d, Expected: %d\n", totalBytesWritten, objInfo.Size)
 		}()
 
-		api := t.tgClient.API()
-
-		type partResult struct {
-			path string
-			err  error
+		// --- KEY OPTIMIZATION: Batch-fetch ALL part documents in a single API call ---
+		// We use the primary client for metadata as it's already "warmed up" with the channel access hash
+		primaryAPI := t.tgClient.API()
+		allDocs, err := t.batchFetchDocuments(streamCtx, primaryAPI, meta.Parts)
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("batch fetch documents failed: %w", err))
+			return
 		}
 
-		numParts := len(meta.Parts)
-		results := make([]chan partResult, numParts)
-		for i := range results {
-			results[i] = make(chan partResult, 1)
-		}
+		const partSize = MaxTelegramChunkSize
+		currentGlobalOffset := int64(0)
 
-		// Parallel pre-fetching for subsequent parts
-		const maxParallelDownloads = 3
-		sem := make(chan struct{}, maxParallelDownloads)
-
-		for i, msgID := range meta.Parts {
-			if i == 0 {
-				continue // First part is streamed directly
-			}
-
-			go func(idx int, mid int) {
-				sem <- struct{}{}
-				defer func() { <-sem }()
-
-				var resp tg.MessagesMessagesClass
-				var getErr error
-				for retries := 0; retries < 15; retries++ {
-					t.hashMu.RLock()
-					resp, getErr = api.ChannelsGetMessages(streamCtx, &tg.ChannelsGetMessagesRequest{
-						Channel: &tg.InputChannel{ChannelID: t.config.BareChannelID, AccessHash: t.channelAccessHash},
-						ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: mid}},
-					})
-					t.hashMu.RUnlock()
-					if getErr == nil {
-						break
-					}
-					if d, ok := tgerr.AsFloodWait(getErr); ok {
-						time.Sleep(d + time.Second)
-						continue
-					}
-					time.Sleep(time.Duration(retries+1) * 2 * time.Second)
-				}
-				if getErr != nil {
-					results[idx] <- partResult{err: fmt.Errorf("pre-fetch failed: %w", getErr)}
-					return
-				}
-
-				msg, _ := t.extractMessage(resp)
-				doc, _ := t.extractDocument(msg)
-				if doc == nil {
-					results[idx] <- partResult{err: fmt.Errorf("invalid document in part %d", idx)}
-					return
-				}
-
-				tmpFile, err := os.CreateTemp("", fmt.Sprintf("minio-tg-pre-%d-*", mid))
-				if err != nil {
-					results[idx] <- partResult{err: err}
-					return
-				}
-				defer tmpFile.Close()
-
-				loc := doc.AsInputDocumentFileLocation()
-				offset := int64(0)
-				limit := 512 * 1024
-
-				for offset < doc.Size {
-					var chunkData []byte
-					var dlErr error
-
-					for retries := 0; retries < 15; retries++ {
-						t.hashMu.RLock()
-						req := &tg.UploadGetFileRequest{
-							Offset:   offset,
-							Limit:    limit,
-							Location: loc,
-						}
-						res, err := api.UploadGetFile(streamCtx, req)
-						t.hashMu.RUnlock()
-
-						if err == nil {
-							switch f := res.(type) {
-							case *tg.UploadFile:
-								chunkData = f.Bytes
-							case *tg.UploadFileCDNRedirect:
-								dlErr = fmt.Errorf("CDN redirect not supported")
-							default:
-								dlErr = fmt.Errorf("unexpected file type: %T", res)
-							}
-							if dlErr == nil {
-								break
-							}
-						} else {
-							dlErr = err
-						}
-
-						if d, ok := tgerr.AsFloodWait(dlErr); ok {
-							time.Sleep(d + time.Second)
-							continue
-						}
-						time.Sleep(time.Duration(retries+1) * 2 * time.Second)
-					}
-
-					if dlErr != nil {
-						err = dlErr
-						break
-					}
-					if len(chunkData) == 0 {
-						break
-					}
-					_, err = tmpFile.Write(chunkData)
-					if err != nil {
-						break
-					}
-					offset += int64(len(chunkData))
-				}
-
-				if err != nil {
-					os.Remove(tmpFile.Name())
-					results[idx] <- partResult{err: err}
-					return
-				}
-
-				results[idx] <- partResult{path: tmpFile.Name()}
-			}(i, msgID)
-		}
-
-		// Consumer loop
-		for i, msgID := range meta.Parts {
-			if i == 0 {
-				// Part 0: Stream directly
-				var resp tg.MessagesMessagesClass
-				var getErr error
-				for retries := 0; retries < 15; retries++ {
-					t.hashMu.RLock()
-					resp, getErr = api.ChannelsGetMessages(streamCtx, &tg.ChannelsGetMessagesRequest{
-						Channel: &tg.InputChannel{ChannelID: t.config.BareChannelID, AccessHash: t.channelAccessHash},
-						ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}},
-					})
-					t.hashMu.RUnlock()
-					if getErr == nil {
-						break
-					}
-					if d, ok := tgerr.AsFloodWait(getErr); ok {
-						time.Sleep(d + time.Second)
-						continue
-					}
-					time.Sleep(time.Duration(retries+1) * 2 * time.Second)
-				}
-				if getErr != nil {
-					fmt.Printf("Telegram Error fetching msg %d: %v\n", msgID, getErr)
-					pw.CloseWithError(getErr)
-					return
-				}
-
-				msg, okMsg := t.extractMessage(resp)
-				doc, okDoc := t.extractDocument(msg)
-				if doc == nil {
-					fmt.Printf("Telegram extraction failed for msg %d. msg_ok:%v doc_ok:%v\n", msgID, okMsg, okDoc)
-					pw.CloseWithError(fmt.Errorf("first part document invalid"))
-					return
-				}
-
-				fmt.Printf("Telegram Starting stream for %s/%s size %d from msg %d (using runCtx)\n", bucket, object, doc.Size, msgID)
-
-				loc := doc.AsInputDocumentFileLocation()
-				offset := int64(0)
-				limit := 512 * 1024
-
-				for offset < doc.Size {
-					var chunkData []byte
-					var dlErr error
-
-					for retries := 0; retries < 15; retries++ {
-						t.hashMu.RLock()
-						req := &tg.UploadGetFileRequest{
-							Offset:   offset,
-							Limit:    limit,
-							Location: loc,
-						}
-						res, err := api.UploadGetFile(streamCtx, req)
-						t.hashMu.RUnlock()
-
-						if err == nil {
-							switch f := res.(type) {
-							case *tg.UploadFile:
-								chunkData = f.Bytes
-							case *tg.UploadFileCDNRedirect:
-								dlErr = fmt.Errorf("CDN redirect not supported")
-							default:
-								dlErr = fmt.Errorf("unexpected file type: %T", res)
-							}
-							if dlErr == nil {
-								break
-							}
-						} else {
-							dlErr = err
-						}
-
-						if d, ok := tgerr.AsFloodWait(dlErr); ok {
-							time.Sleep(d + time.Second)
-							continue
-						}
-						fmt.Printf("Telegram Chunk fetch retry %d at offset %d: %v\n", retries+1, offset, dlErr)
-						time.Sleep(time.Duration(retries+1) * 2 * time.Second)
-					}
-
-					if dlErr != nil {
-						fmt.Printf("Telegram Error downloading chunk at offset %d: %v\n", offset, dlErr)
-						pw.CloseWithError(dlErr)
-						return
-					}
-
-					if len(chunkData) == 0 {
-						break // EOF reached
-					}
-
-					_, writeErr := tw.Write(chunkData)
-					if writeErr != nil {
-						pw.CloseWithError(writeErr)
-						return
-					}
-
-					offset += int64(len(chunkData))
-				}
+		for _, msgID := range meta.Parts {
+			doc, ok := allDocs[msgID]
+			if !ok {
+				// Document missing from batch response; skip with fallback offset
+				fmt.Printf("warning: document for msgID %d not found in batch response\n", msgID)
+				currentGlobalOffset += partSize
 				continue
 			}
 
-			// Subsequent parts: from Disk
-			select {
-			case res := <-results[i]:
-				if res.err != nil {
-					pw.CloseWithError(res.err)
-					return
+			partStart := currentGlobalOffset
+			partEnd := currentGlobalOffset + doc.Size
+
+			// Stop early if we've already served the entire requested range
+			if currentGlobalOffset >= startOffset+length {
+				break
+			}
+
+			// Check if this part overlaps with the requested range
+			if startOffset < partEnd && (startOffset+length) > partStart {
+				relativeStart := int64(0)
+				if startOffset > partStart {
+					relativeStart = startOffset - partStart
 				}
-				f, err := os.Open(res.path)
-				if err != nil {
+
+				overlapEnd := partEnd
+				if startOffset+length < partEnd {
+					overlapEnd = startOffset + length
+				}
+				relativeLength := overlapEnd - (partStart + relativeStart)
+
+				// Clamp to actual document size
+				if relativeStart >= doc.Size {
+					currentGlobalOffset += doc.Size
+					continue
+				}
+				if relativeStart+relativeLength > doc.Size {
+					relativeLength = doc.Size - relativeStart
+				}
+
+				// Round-robin across download clients for maximum throughput
+				api := t.nextDownloadAPI()
+				if err := t.downloadTelegramDocument(streamCtx, api, doc, tw, relativeStart, relativeLength); err != nil {
 					pw.CloseWithError(err)
 					return
 				}
-				_, err = io.Copy(tw, f)
-				f.Close()
-				os.Remove(res.path)
-				if err != nil {
-					if !errors.Is(err, io.ErrClosedPipe) {
-						pw.CloseWithError(err)
-					}
-					return
-				}
-			case <-streamCtx.Done():
-				return
 			}
+
+			currentGlobalOffset += doc.Size
 		}
 	}()
 
-	// Use the actual object size from metadata to satisfy MinIO's Content-Length
-	// and HTTPRangeSpec validation checks.
 	return NewGetObjectReaderFromReader(pr, objInfo, opts)
 }
 
-// Helper methods to reduce duplication
+// Helper methods
 func (t *TelegramObjectLayer) extractMessage(resp tg.MessagesMessagesClass) (*tg.Message, bool) {
 	if resp == nil {
-		fmt.Printf("extractMessage: resp is nil\n")
 		return nil, false
 	}
-	fmt.Printf("extractMessage: resp type is %T\n", resp)
-
 	var msg *tg.Message
 	switch msgs := resp.(type) {
 	case *tg.MessagesMessages:
-		fmt.Printf("extractMessage: MessagesMessages length %d\n", len(msgs.Messages))
 		if len(msgs.Messages) > 0 {
-			fmt.Printf("extractMessage: first message type is %T\n", msgs.Messages[0])
 			msg, _ = msgs.Messages[0].(*tg.Message)
 		}
 	case *tg.MessagesMessagesSlice:
-		fmt.Printf("extractMessage: MessagesMessagesSlice length %d\n", len(msgs.Messages))
 		if len(msgs.Messages) > 0 {
-			fmt.Printf("extractMessage: first message type is %T\n", msgs.Messages[0])
 			msg, _ = msgs.Messages[0].(*tg.Message)
 		}
 	case *tg.MessagesChannelMessages:
-		fmt.Printf("extractMessage: MessagesChannelMessages length %d\n", len(msgs.Messages))
 		if len(msgs.Messages) > 0 {
-			fmt.Printf("extractMessage: first message type is %T\n", msgs.Messages[0])
 			msg, _ = msgs.Messages[0].(*tg.Message)
 		}
-	default:
-		fmt.Printf("extractMessage: unknown MessagesMessagesClass type: %T\n", msgs)
 	}
 	return msg, msg != nil
 }
@@ -575,7 +552,6 @@ func (t *TelegramObjectLayer) DeleteObject(ctx context.Context, bucket, object s
 	var metaBytes []byte
 	err := t.db.QueryRowContext(ctx, "SELECT metadata FROM objects WHERE bucket=$1 AND key=$2", bucket, object).Scan(&metaBytes)
 	if err == sql.ErrNoRows {
-		// MinIO expects an empty ObjectInfo on successful delete of a non-existent object
 		return ObjectInfo{}, nil
 	}
 
@@ -586,13 +562,11 @@ func (t *TelegramObjectLayer) DeleteObject(ctx context.Context, bucket, object s
 
 	if len(meta.Parts) > 0 {
 		go func() {
-			t.hashMu.RLock()
-			// Best effort deletion
+			hash := t.channelAccessHash.Load()
 			t.tgClient.API().ChannelsDeleteMessages(context.Background(), &tg.ChannelsDeleteMessagesRequest{
-				Channel: &tg.InputChannel{ChannelID: t.config.BareChannelID, AccessHash: t.channelAccessHash},
+				Channel: &tg.InputChannel{ChannelID: t.config.BareChannelID, AccessHash: hash},
 				ID:      meta.Parts,
 			})
-			t.hashMu.RUnlock()
 		}()
 	}
 
@@ -676,7 +650,6 @@ func (t *TelegramObjectLayer) ListObjectsV2(ctx context.Context, bucket, prefix,
 		return t.base.ListObjectsV2(ctx, bucket, prefix, continuationToken, delimiter, maxKeys, fetchOwner, startAfter)
 	}
 
-	// Use the V1 list implementation
 	info, err := t.ListObjects(ctx, bucket, prefix, continuationToken, delimiter, maxKeys)
 	if err != nil {
 		return ListObjectsV2Info{}, err
@@ -688,10 +661,6 @@ func (t *TelegramObjectLayer) ListObjectsV2(ctx context.Context, bucket, prefix,
 		NextContinuationToken: info.NextMarker,
 	}, nil
 }
-
-// These functions are not needed for the telegram backend, but are required by the ObjectLayer interface.
-// The embedded base layer will handle them for system buckets.
-// For user buckets, we can return NotImplemented or a sensible default.
 
 func (t *TelegramObjectLayer) CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (ObjectInfo, error) {
 	if t.isSystemBucket(srcBucket) && t.isSystemBucket(destBucket) {
@@ -719,5 +688,5 @@ func (t *TelegramObjectLayer) ListObjectVersions(ctx context.Context, bucket, pr
 	if t.isSystemBucket(bucket) {
 		return t.base.ListObjectVersions(ctx, bucket, prefix, marker, versionMarker, delimiter, maxKeys)
 	}
-	return ListObjectVersionsInfo{}, nil // No versioning for telegram backend
+	return ListObjectVersionsInfo{}, nil
 }
