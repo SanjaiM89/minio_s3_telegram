@@ -215,3 +215,14 @@ mc ls my-telegram-s3/my-first-bucket/
 # Download a file
 mc cp my-telegram-s3/my-first-bucket/remote_file.txt ./
 ```
+
+---
+
+## Important Considerations for the Telegram Backend
+
+Because this MinIO instance uses Telegram as its core storage mechanism, there are a few backend-specific constraints S3 clients should be aware of:
+
+1. **Upload Size Limits**: Depending on the Telegram API limits and backend chunking configuration, extremely large single-PUT uploads might be constrained. Multipart uploads are currently stubbed.
+2. **Download Latency (Proxies)**: If the MinIO server is connected to Telegram via an MTProto Proxy, downloads might experience momentary stutters as the server actively reconstructs dropped chunks. S3 SDKs with default timeout settings might need extended timeout values.
+3. **Session State**: The MinIO server must maintain a persistent `tg_session.json` file. If the storage administrator loses this session or migrates the server without it, the bot token can hit a `FLOOD_WAIT` rate limit from Telegram, causing temporary API failures for all clients.
+4. **Access Isolation**: Files uploaded by a specific Telegram Bot token can only be downloaded by that exact same Bot token due to Telegram privacy policies.

@@ -1,11 +1,11 @@
 # MinIO Telegram Storage Gateway
 
-This modification allows MinIO to use Telegram as an object storage backend, with Redis handling metadata.
+This modification allows MinIO to use Telegram as an object storage backend, with PostgreSQL handling metadata.
 
 ## Prerequisites
 
-- **Go 1.21+**
-- **Redis** running locally or accessible.
+- **Go 1.25+**
+- **PostgreSQL** database accessible via connection URL.
 - **Telegram App credentials** (`API_ID`, `API_HASH`) from [telegram.org](https://my.telegram.org).
 - **Telegram Bot Token** (from @BotFather).
 - **Target Channel ID** (where files will be stored). The bot must be an admin in this channel.
@@ -13,10 +13,8 @@ This modification allows MinIO to use Telegram as an object storage backend, wit
 ## Setup
 
 1.  **Dependencies**:
-    Run the following in the `minio` directory to download required modules:
+    Run the following in the `minio` directory to fetch the modules:
     ```bash
-    go get github.com/gotd/td/telegram
-    go get github.com/go-redis/redis/v8
     go mod tidy
     ```
 
@@ -29,9 +27,8 @@ This modification allows MinIO to use Telegram as an object storage backend, wit
     export TELEGRAM_API_HASH=your_api_hash
     export TELEGRAM_BOT_TOKEN=your_bot_token
     export TELEGRAM_CHANNEL_ID=-100xxxxxxxxxx  # Ensure it starts with -100 for channels
-    export REDIS_URL=localhost:6379
-    export REDIS_PASSWORD=
-    export REDIS_DB=0
+    export POSTGRES_URL=postgresql://user:password@localhost:5432/dbname
+    export TG_PROXY=tg://proxy?server=...  # Optional: MTProto proxy for reliable connections
     
     # MinIO Standard Envs (Optional)
     export MINIO_ROOT_USER=minioadmin
@@ -64,14 +61,13 @@ mc rm mytg/testbucket/myphoto.jpg
 
 ## Implementation Details
 
-- **Metadata**: Stored in Redis keys:
-    - Buckets: `minio:buckets` (Set)
-    - Objects: `minio:object:<bucket>:<key>` (JSON String)
-- **Storage**: Files are uploaded to the specified Telegram channel.
-- **Limit**: Currently supports files up to ~1.9GB (single chunk). Multipart upload is stubbed.
+- **Metadata**: Stored in a PostgreSQL database table (`objects`).
+- **Storage**: Files are uploaded to the specified Telegram channel in 20MB chunks (`parts` tracking).
+- **Session Persistence**: Authentication utilizes a local `tg_session.json` to prevent re-authentication on every server restart. Without this, the bot token can encounter `FLOOD_WAIT (1556 seconds)` closures.
+- **Resilient Downloads**: Manual `api.UploadGetFile` chunk fetching is employed with a connection recovery loop (~15 retries) to withstand TCP disconnects common to MTProto proxies.
 
 ## Limitations
 
-- **Multipart Uploads**: Not fully implemented.
-- **Range Requests**: Not fully optimized.
+- **Bot Access Isolation**: Telegram enforces strict privacy. Bots **cannot read files uploaded by other bots** even if they are both admins. Always use the identical bot token for uploads and downloads.
+- **Range Requests**: Fully fetching arbitrary byte chunks is supported, but sequential downloading over unreliable proxy networks might incur retry latency.
 - **Authentication**: Uses Bot API (via `gotd`). Ensure the bot has rights to upload to the channel.
