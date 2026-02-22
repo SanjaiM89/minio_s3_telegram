@@ -59,3 +59,5 @@ node_modules/
 minio_tg
 minio-telegram
 minio-telegram.exe
+
+tg_session.json

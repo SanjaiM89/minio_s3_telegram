@@ -222,7 +222,9 @@ func setObjectHeaders(ctx context.Context, w http.ResponseWriter, objInfo Object
 	}
 
 	// Set content length.
-	w.Header().Set(xhttp.ContentLength, strconv.FormatInt(rangeLen, 10))
+	if rangeLen >= 0 {
+		w.Header().Set(xhttp.ContentLength, strconv.FormatInt(rangeLen, 10))
+	}
 	if rs != nil {
 		contentRange := fmt.Sprintf("bytes %d-%d/%d", start, start+rangeLen-1, totalObjectSize)
 		w.Header().Set(xhttp.ContentRange, contentRange)
