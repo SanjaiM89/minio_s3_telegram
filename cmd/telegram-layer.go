@@ -23,9 +23,9 @@ import (
 )
 
 const (
-	numUploadWorkers    = 8   // Number of concurrent upload workers
-	uploadQueueCapacity = 200 // Capacity of the upload job queue
-	numDownloadClients  = 4   // Number of parallel Telegram clients for downloads
+	numUploadWorkers    = 12  // Number of concurrent upload workers
+	uploadQueueCapacity = 512 // Capacity of the upload job queue
+	numDownloadClients  = 8   // Number of parallel Telegram clients for downloads
 )
 
 // uploadJob represents a single file chunk to be uploaded to Telegram.
@@ -45,8 +45,8 @@ type uploadResult struct {
 
 // TelegramObjectLayer implements ObjectLayer interface using Telegram as backend
 type TelegramObjectLayer struct {
-	ObjectLayer                    // Embeds ALL native MinIO methods automatically!
-	base              ObjectLayer  // Reference to native layer for delegation
+	ObjectLayer                   // Embeds ALL native MinIO methods automatically!
+	base              ObjectLayer // Reference to native layer for delegation
 	tgClient          *telegram.Client
 	downloadClients   []*telegram.Client // Pool of clients for parallel downloads
 	dlClientIdx       atomic.Uint64      // Round-robin index for download clients
@@ -70,7 +70,7 @@ func (t *TelegramObjectLayer) nextDownloadAPI() *tg.Client {
 
 // uploadWorker is a background worker that processes upload jobs from the queue.
 func (t *TelegramObjectLayer) uploadWorker() {
-	u := uploader.NewUploader(t.tgClient.API()).WithThreads(16).WithPartSize(512 * 1024)
+	u := uploader.NewUploader(t.tgClient.API()).WithThreads(24).WithPartSize(1024 * 1024)
 	sender := message.NewSender(t.tgClient.API()).WithUploader(u)
 
 	t.hashMu.RLock()
@@ -186,6 +186,52 @@ func (t *TelegramObjectLayer) tgReady(ctx context.Context) error {
 	}
 }
 
+func (t *TelegramObjectLayer) resolveChannelAccessHash(ctx context.Context, api *tg.Client) (int64, error) {
+	if api == nil {
+		api = t.tgClient.API()
+	}
+
+	var hash int64
+
+	chResult, _ := api.ChannelsGetChannels(ctx, []tg.InputChannelClass{
+		&tg.InputChannel{ChannelID: t.config.BareChannelID, AccessHash: 0},
+	})
+	if chats, ok := chResult.(*tg.MessagesChats); ok && len(chats.Chats) > 0 {
+		for _, chat := range chats.Chats {
+			if c, ok := chat.(*tg.Channel); ok && c.ID == t.config.BareChannelID {
+				hash = c.AccessHash
+				break
+			}
+		}
+	}
+
+	if hash == 0 {
+		dialogs, _ := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{Limit: 100})
+		if d, ok := dialogs.(tg.MessagesDialogsClass); ok {
+			var chats []tg.ChatClass
+			switch v := d.(type) {
+			case *tg.MessagesDialogs:
+				chats = v.Chats
+			case *tg.MessagesDialogsSlice:
+				chats = v.Chats
+			}
+			for _, chat := range chats {
+				if c, ok := chat.(*tg.Channel); ok && c.ID == t.config.BareChannelID {
+					hash = c.AccessHash
+					break
+				}
+			}
+		}
+	}
+
+	if hash == 0 {
+		return 0, fmt.Errorf("unable to resolve channel access hash for channel %d", t.config.BareChannelID)
+	}
+
+	t.channelAccessHash.Store(hash)
+	return hash, nil
+}
+
 // newTelegramClient creates a new Telegram client with the given config and options.
 func newTelegramClient(cfg *TelegramConfig, sessionPath string, proxyURL string) (*telegram.Client, error) {
 	opts := telegram.Options{
@@ -283,7 +329,7 @@ func NewTelegramObjectLayer(ctx context.Context, base ObjectLayer) (ObjectLayer,
 							return authErr
 						}
 					}
-					
+
 					// Warm up download client session by fetching dialogs or the channel
 					// This prevents CHANNEL_INVALID errors if they ever need to use channel-scoped methods
 					api := dlClient.API()
@@ -318,45 +364,8 @@ func NewTelegramObjectLayer(ctx context.Context, base ObjectLayer) (ObjectLayer,
 				}
 
 				api := primaryClient.API()
-				var hash int64
-
-				// Strategy 1: Direct fetch (works if already known to session)
-				chResult, _ := api.ChannelsGetChannels(ctx, []tg.InputChannelClass{
-					&tg.InputChannel{ChannelID: cfg.BareChannelID, AccessHash: 0},
-				})
-				if chats, ok := chResult.(*tg.MessagesChats); ok && len(chats.Chats) > 0 {
-					for _, chat := range chats.Chats {
-						if c, ok := chat.(*tg.Channel); ok && c.ID == cfg.BareChannelID {
-							hash = c.AccessHash
-							break
-						}
-					}
-				}
-
-				// Strategy 2: Dialogs (more reliable for Bots to discover channels)
-				if hash == 0 {
-					dialogs, _ := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
-						Limit: 100,
-					})
-					if d, ok := dialogs.(tg.MessagesDialogsClass); ok {
-						var chats []tg.ChatClass
-						switch v := d.(type) {
-						case *tg.MessagesDialogs:
-							chats = v.Chats
-						case *tg.MessagesDialogsSlice:
-							chats = v.Chats
-						}
-						for _, chat := range chats {
-							if c, ok := chat.(*tg.Channel); ok && c.ID == cfg.BareChannelID {
-								hash = c.AccessHash
-								break
-							}
-						}
-					}
-				}
-
-				if hash != 0 {
-					layer.channelAccessHash.Store(hash)
+				hash, err := layer.resolveChannelAccessHash(ctx, api)
+				if err == nil {
 					fmt.Printf("Telegram channelAccessHash resolved: %d\n", hash)
 				} else {
 					fmt.Printf("Warning: Failed to resolve channelAccessHash for ID %d. Retrying in loop...\n", cfg.BareChannelID)
