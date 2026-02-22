@@ -208,14 +208,25 @@ func (t *TelegramObjectLayer) batchFetchDocuments(ctx context.Context, api *tg.C
 
 	var resp tg.MessagesMessagesClass
 	var lastErr error
-	for retries := 0; retries < 15; retries++ {
-		resp, lastErr = api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
-			Channel: &tg.InputChannel{ChannelID: t.config.BareChannelID, AccessHash: hash},
+	channelReq := func(accessHash int64) *tg.ChannelsGetMessagesRequest {
+		return &tg.ChannelsGetMessagesRequest{
+			Channel: &tg.InputChannel{ChannelID: t.config.BareChannelID, AccessHash: accessHash},
 			ID:      ids,
-		})
+		}
+	}
+	for retries := 0; retries < 15; retries++ {
+		resp, lastErr = api.ChannelsGetMessages(ctx, channelReq(hash))
 		if lastErr == nil {
 			break
 		}
+
+		if tgerr.Is(lastErr, "CHANNEL_INVALID") || tgerr.Is(lastErr, "CHANNEL_PRIVATE") {
+			if refreshedHash, refreshErr := t.resolveChannelAccessHash(ctx, api); refreshErr == nil && refreshedHash != 0 && refreshedHash != hash {
+				hash = refreshedHash
+				continue
+			}
+		}
+
 		if d, ok := tgerr.AsFloodWait(lastErr); ok {
 			time.Sleep(d + time.Second)
 			continue
@@ -252,13 +263,12 @@ func (t *TelegramObjectLayer) batchFetchDocuments(ctx context.Context, api *tg.C
 }
 
 func (t *TelegramObjectLayer) downloadTelegramDocument(ctx context.Context, api *tg.Client, doc *tg.Document, w io.Writer, startOffset, length int64) error {
-	loc := doc.AsInputDocumentFileLocation()
 	if length == -1 {
 		length = doc.Size - startOffset
 	}
 
 	const chunkSize = 1024 * 1024 // 1 MiB chunks (Telegram max)
-	const maxParallelChunks = 64
+	const maxParallelChunks = 32
 
 	type chunkResult struct {
 		offset int64
@@ -278,12 +288,12 @@ func (t *TelegramObjectLayer) downloadTelegramDocument(ctx context.Context, api 
 		// 2. offset is a multiple of limit
 		// 3. limit <= 1048576 (1 MiB)
 		// We align our requests to chunkSize boundaries and trim later.
-		
+
 		requestedEnd := startOffset + length
-		
+
 		// First block might be unaligned
 		firstBlockStart := (startOffset / int64(chunkSize)) * int64(chunkSize)
-		
+
 		for fetchOffset := firstBlockStart; fetchOffset < requestedEnd; fetchOffset += int64(chunkSize) {
 			select {
 			case <-fetchCtx.Done():
@@ -294,15 +304,18 @@ func (t *TelegramObjectLayer) downloadTelegramDocument(ctx context.Context, api 
 			go func(off int64) {
 				var chunkData []byte
 				var dlErr error
+				downloadAPI := api
+				currentDoc := doc
+				currentLoc := currentDoc.AsInputDocumentFileLocation()
 
 				for retries := 0; retries < 15; retries++ {
 					// We always request a full chunkSize to satisfy alignment
 					req := &tg.UploadGetFileRequest{
 						Offset:   off,
 						Limit:    chunkSize,
-						Location: loc,
+						Location: currentLoc,
 					}
-					res, err := api.UploadGetFile(fetchCtx, req)
+					res, err := downloadAPI.UploadGetFile(fetchCtx, req)
 					if err == nil {
 						switch f := res.(type) {
 						case *tg.UploadFile:
@@ -320,6 +333,20 @@ func (t *TelegramObjectLayer) downloadTelegramDocument(ctx context.Context, api 
 						dlErr = err
 					}
 
+					if tgerr.Is(dlErr, "FILE_REFERENCE_EXPIRED") {
+						freshDoc, refreshErr := t.fetchSingleDocument(fetchCtx, currentDoc.ID)
+						if refreshErr != nil {
+							dlErr = fmt.Errorf("refresh file reference for doc %d failed: %w", currentDoc.ID, refreshErr)
+							break
+						}
+						if freshDoc != nil {
+							currentDoc = freshDoc
+							currentLoc = freshDoc.AsInputDocumentFileLocation()
+							downloadAPI = t.nextDownloadAPI()
+							continue
+						}
+					}
+
 					if d, ok := tgerr.AsFloodWait(dlErr); ok {
 						time.Sleep(d + time.Second)
 						continue
@@ -330,8 +357,8 @@ func (t *TelegramObjectLayer) downloadTelegramDocument(ctx context.Context, api 
 				<-sem
 
 				// Trim the chunk data if it exceeds actual document size
-				if int64(len(chunkData)) > doc.Size - off {
-					chunkData = chunkData[:doc.Size-off]
+				if int64(len(chunkData)) > currentDoc.Size-off {
+					chunkData = chunkData[:currentDoc.Size-off]
 				}
 
 				select {
@@ -351,12 +378,12 @@ func (t *TelegramObjectLayer) downloadTelegramDocument(ctx context.Context, api 
 		if data, ok := received[currentBlockOffset]; ok {
 			// Calculate overlap with requested range [startOffset, requestedEnd)
 			blockEnd := currentBlockOffset + int64(len(data))
-			
+
 			writeStart := int64(0)
 			if currentBlockOffset < startOffset {
 				writeStart = startOffset - currentBlockOffset
 			}
-			
+
 			writeEnd := int64(len(data))
 			if blockEnd > requestedEnd {
 				writeEnd = int64(len(data)) - (blockEnd - requestedEnd)
@@ -367,7 +394,7 @@ func (t *TelegramObjectLayer) downloadTelegramDocument(ctx context.Context, api 
 					return err
 				}
 			}
-			
+
 			delete(received, currentBlockOffset)
 			currentBlockOffset += int64(chunkSize) // Move to next alignment boundary
 			continue
@@ -385,6 +412,28 @@ func (t *TelegramObjectLayer) downloadTelegramDocument(ctx context.Context, api 
 	}
 
 	return nil
+}
+
+func (t *TelegramObjectLayer) fetchSingleDocument(ctx context.Context, msgID int64) (*tg.Document, error) {
+	if msgID == 0 {
+		return nil, fmt.Errorf("invalid message id")
+	}
+
+	api := t.tgClient.API()
+	maxInt := int64(^uint(0) >> 1)
+	if msgID > maxInt {
+		return nil, fmt.Errorf("message id %d overflows int", msgID)
+	}
+
+	docs, err := t.batchFetchDocuments(ctx, api, []int{int(msgID)})
+	if err != nil {
+		return nil, err
+	}
+	doc := docs[int(msgID)]
+	if doc == nil {
+		return nil, fmt.Errorf("document not found for message %d", msgID)
+	}
+	return doc, nil
 }
 
 func (t *TelegramObjectLayer) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (gr *GetObjectReader, err error) {
