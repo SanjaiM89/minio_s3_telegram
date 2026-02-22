@@ -414,22 +414,17 @@ func (t *TelegramObjectLayer) downloadTelegramDocument(ctx context.Context, api 
 	return nil
 }
 
-func (t *TelegramObjectLayer) fetchSingleDocument(ctx context.Context, msgID int64) (*tg.Document, error) {
+func (t *TelegramObjectLayer) fetchSingleDocument(ctx context.Context, msgID int) (*tg.Document, error) {
 	if msgID == 0 {
 		return nil, fmt.Errorf("invalid message id")
 	}
 
 	api := t.tgClient.API()
-	maxInt := int64(^uint(0) >> 1)
-	if msgID > maxInt {
-		return nil, fmt.Errorf("message id %d overflows int", msgID)
-	}
-
-	docs, err := t.batchFetchDocuments(ctx, api, []int{int(msgID)})
+	docs, err := t.batchFetchDocuments(ctx, api, []int{msgID})
 	if err != nil {
 		return nil, err
 	}
-	doc := docs[int(msgID)]
+	doc := docs[msgID]
 	if doc == nil {
 		return nil, fmt.Errorf("document not found for message %d", msgID)
 	}
